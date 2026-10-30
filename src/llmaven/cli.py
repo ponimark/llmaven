@@ -473,6 +473,63 @@ def _prepare_extract_output_file(
     return path
 
 
+class _TransientHTTPError(Exception):
+    """Marker raised internally so the retry helper knows a response should be retried."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+# Retry config for transient HTTP failures (5xx + 429) and connection errors.
+# Exposed at module scope so tests can monkey-patch a no-wait variant.
+_RETRY_MAX_ATTEMPTS = 5
+_RETRY_WAIT_MULTIPLIER = 1.0
+_RETRY_WAIT_MIN_SECONDS = 1.0
+_RETRY_WAIT_MAX_SECONDS = 10.0
+
+
+def _is_transient_http_status(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code < 600
+
+
+def _http_get_with_retry(
+    client,
+    *,
+    url: str,
+    params: dict,
+    headers: dict,
+):
+    """Issue an HTTP GET, retrying on transient HTTP failures and connection errors.
+
+    Retries on:
+      - httpx.RequestError (connect timeouts, DNS failures, etc.)
+      - HTTP 429 (rate limited)
+      - HTTP 5xx (server errors)
+
+    Non-retryable HTTP errors (e.g. 4xx other than 429) surface immediately
+    via raise_for_status().
+    """
+    import httpx
+
+    for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+        try:
+            resp = client.get(url, params=params, headers=headers)
+            if _is_transient_http_status(resp.status_code):
+                raise _TransientHTTPError(
+                    f"transient HTTP {resp.status_code} from {url}",
+                    status_code=resp.status_code,
+                )
+            resp.raise_for_status()
+            return resp
+        except (_TransientHTTPError, httpx.RequestError):
+            if attempt == _RETRY_MAX_ATTEMPTS:
+                raise
+            # Exponential backoff: multiplier * 2**(attempt-1), clamped to [min, max].
+            wait = _RETRY_WAIT_MULTIPLIER * 2 ** (attempt - 1)
+            sleep(max(_RETRY_WAIT_MIN_SECONDS, min(wait, _RETRY_WAIT_MAX_SECONDS)))
+
+
 def _extract_litellm_logs(
     start_date_obj: "date",
     end_date_obj: "date",
@@ -499,7 +556,6 @@ def _extract_litellm_logs(
     with zipfile.ZipFile(
         output_file, mode="w", compression=zipfile.ZIP_DEFLATED
     ) as zipf:
-        # TODO: Add retry logic (https://github.com/uw-ssec/llmaven/issues/88).
         with httpx.Client(timeout=30.0) as http_client:
             current_date = start_date_obj
             while current_date <= end_date_obj:
@@ -517,21 +573,15 @@ def _extract_litellm_logs(
                 }
 
                 try:
-                    resp = http_client.get(endpoint, params=params, headers=headers)
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code >= 500:
-                        print(
-                            f"Server error for {date_str}: {exc.response.status_code}. Cooling off for 60 seconds..."
-                        )
-                        sleep(60)  # brief pause before retrying on server errors
-                    else:
-                        _fail_extract(
-                            f"LiteLLM /spend/logs failed for {date_str}: {exc}"
-                        )
-                except httpx.HTTPError as exc:
-                    # Transport errors have no response to read; don't fall
-                    # through to a stale or unbound `resp`.
+                    resp = _http_get_with_retry(
+                        http_client,
+                        url=endpoint,
+                        params=params,
+                        headers=headers,
+                    )
+                except (_TransientHTTPError, httpx.HTTPError) as exc:
+                    # Retries are exhausted or the error is not transient; fail
+                    # rather than fall through to a stale or unbound `resp`.
                     _fail_extract(f"LiteLLM /spend/logs failed for {date_str}: {exc}")
 
                 try:
